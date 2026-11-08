@@ -10,6 +10,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var status: NSStatusItem!
     let menu = NSMenu()
     var recognizers: [UInt64: TapRecognizer] = [:]
+    var cursorGuard = CursorGuard()
+    var pendingPoints = [UInt64: CGPoint]()
+    var nextPendingID: UInt64 = 0
+    var settings: TapSettings = {
+        guard let data = UserDefaults.standard.data(forKey: "tapSettings"),
+              let decoded = try? JSONDecoder().decode(TapSettings.self, from: data) else { return .fast }
+        return decoded.sanitized
+    }()
+    var settingsWindow: TapSettingsWindow?
+    var rejectionCounts = [TapRejection: Int]()
+    var cancelledClicks = 0
     var enabled = !CommandLine.arguments.contains("--smoke-test") && UserDefaults.standard.bool(forKey: "enabled")
     var message = "Выключено"
     var eventTap: CFMachPort?
@@ -41,7 +52,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status.menu = menu; menu.delegate = self
         bridge.handler = { [weak self] device, contacts, count, time in
             guard let self, self.enabled, !self.sleeping else { return }
-            if count < 0 { self.invalidFrames += 1; self.cancelGestures(); return }
+            if count < 0 { self.invalidFrames += 1; self.cancelGestures(reason: .invalidFrame); return }
             self.frames += 1
             let values = (0..<Int(count)).map { index -> Touch in
                 let c = contacts![index]
@@ -49,10 +60,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if values.isEmpty { self.emptyFrames += 1 }
             for contact in values { self.stateCounts[contact.state, default: 0] += 1 }
-            var recognizer = self.recognizers[device] ?? TapRecognizer()
+            var recognizer = self.recognizers[device] ?? TapRecognizer(settings: self.settings)
+            let wasActive = recognizer.isActive
             let interfered = ProcessInfo.processInfo.systemUptime - self.lastInterference < 0.15 || self.anyButtonDown()
             if interfered { self.interferenceFrames += 1 }
             let tap = recognizer.frame(values, time: time, interference: interfered)
+            self.recordRejection(recognizer.lastRejection)
+            if recognizer.isActive && !wasActive {
+                if let point = CGEvent(source: nil)?.location { self.cursorGuard.begin(device: device, at: point) }
+                else { recognizer.cancel(reason: .invalidFrame) }
+            }
+            if !recognizer.isActive { self.cursorGuard.end(device: device) }
             self.recognizers[device] = recognizer
             if tap { self.recognizedTaps += 1; self.scheduleClick() }
         }
@@ -65,8 +83,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
         if CommandLine.arguments.contains("--smoke-test") {
             showInfo()
+            showSettings()
+            // Smoke mode forces enabled=false: exercise pending-tap ordering without posting input.
+            let before = cancelledClicks
+            scheduleClick(); scheduleClick()
+            precondition(pendingPoints.count == 2, "Rapid taps must remain separate")
+            cancelPendingClick()
+            precondition(pendingPoints.isEmpty && cancelledClicks == before + 2, "Cancel must clear all pending taps")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                print("PASS: AppKit launch, status menu, diagnostics window, device notifications, disabled startup; no listeners or clicks")
+                print("PASS: AppKit launch, status menu, diagnostics and sensitivity windows, device notifications, disabled startup; no listeners or clicks")
                 NSApp.terminate(nil)
             }
         }
@@ -75,11 +100,34 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func anyButtonDown() -> Bool {
         (0..<5).contains { CGEventSource.buttonState(.combinedSessionState, button: CGMouseButton(rawValue: UInt32($0))!) }
     }
-    func cancelGestures(preserveIdle: Bool = false) {
+    func recordRejection(_ reason: TapRejection?) {
+        if let reason { rejectionCounts[reason, default: 0] += 1 }
+    }
+    func cancelPendingClick() {
+        cancelledClicks += pendingPoints.count
+        pendingPoints.removeAll()
         pendingGeneration &+= 1
+    }
+    func cancelGestures(preserveIdle: Bool = false, reason: TapRejection? = nil) {
+        cancelPendingClick()
         for key in Array(recognizers.keys) {
-            if preserveIdle { recognizers[key]?.cancelIfActive() }
-            else { recognizers[key]?.cancel() }
+            let wasActive = recognizers[key]?.isActive == true
+            if preserveIdle { recognizers[key]?.cancelIfActive(reason: reason) }
+            else { recognizers[key]?.cancel(reason: reason) }
+            if wasActive && reason != nil { recordRejection(recognizers[key]?.lastRejection) }
+        }
+        cursorGuard.reset()
+    }
+    func cursorMoved(to point: CGPoint) {
+        for device in cursorGuard.movedDevices(to: point, tolerance: settings.cursorTolerance) {
+            recognizers[device]?.cancelIfActive(reason: .pointerMovement)
+            recordRejection(recognizers[device]?.lastRejection)
+            cursorGuard.end(device: device)
+        }
+        for (id, origin) in pendingPoints {
+            if !point.x.isFinite || !point.y.isFinite || hypot(point.x-origin.x,point.y-origin.y) > settings.cursorTolerance {
+                pendingPoints.removeValue(forKey: id); cancelledClicks += 1
+            }
         }
     }
     func stop() {
@@ -97,11 +145,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 c.cancelGestures()
                 if c.enabled, let tap = c.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             } else if event.getIntegerValueField(.eventSourceUserData) != eventTag {
-                // Idle cursor movement must not suppress the next deliberate tap.
-                // It still cancels any active touch or already scheduled click.
-                if type != .mouseMoved { c.lastInterference = ProcessInfo.processInfo.systemUptime }
-                c.lastClick = -.infinity
-                c.cancelGestures(preserveIdle: true)
+                if type == .mouseMoved {
+                    c.cursorMoved(to: event.location)
+                } else {
+                    c.lastInterference = ProcessInfo.processInfo.systemUptime
+                    c.lastClick = -.infinity
+                    c.cancelGestures(preserveIdle: true, reason: .interference)
+                }
             }
             return Unmanaged.passUnretained(event)
         }, userInfo: nil)
@@ -127,16 +177,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateInfo()
     }
     func scheduleClick() {
-        pendingGeneration &+= 1
         let token = pendingGeneration
-        let point = CGEvent(source: nil)?.location ?? .zero
-        // Short guard window lets physical click/scroll events cancel a pending tap.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
-            guard let self, self.pendingGeneration == token, self.enabled, !self.sleeping,
+        nextPendingID &+= 1
+        let id = nextPendingID
+        guard let point = CGEvent(source: nil)?.location else { return }
+        pendingPoints[id] = point
+        // A configurable short window lets native physical clicks/scroll cancel a tap.
+        DispatchQueue.main.asyncAfter(deadline: .now() + settings.clickDelay) { [weak self] in
+            guard let self, self.pendingGeneration == token, self.pendingPoints[id] != nil else { return }
+            defer { self.pendingPoints.removeValue(forKey: id) }
+            guard self.enabled, !self.sleeping,
                   AXIsProcessTrusted(), CGPreflightListenEventAccess(), !self.anyButtonDown(),
                   ProcessInfo.processInfo.systemUptime - self.lastInterference > 0.15,
                   let current = CGEvent(source: nil)?.location,
-                  hypot(current.x-point.x,current.y-point.y) < 3 else { return }
+                  hypot(current.x-point.x,current.y-point.y) <= self.settings.cursorTolerance else {
+                self.cancelledClicks += 1; return
+            }
             self.postClick(at: current)
         }
     }
@@ -198,6 +254,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         item("MagicTap — \(message)",nil)
         item("Клик касанием",#selector(toggle),enabled)
+        item("Чувствительность…",#selector(showSettings))
         menu.addItem(.separator())
         item("1. Разрешить Универсальный доступ…",#selector(requestAccessibility),AXIsProcessTrusted())
         item("2. Разрешить Мониторинг ввода…",#selector(requestInput),CGPreflightListenEventAccess())
@@ -207,15 +264,35 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item("Диагностика и инструкция…",#selector(showInfo))
         menu.addItem(.separator()); item("Завершить MagicTap",#selector(quit))
     }
+    @objc func showSettings() {
+        if settingsWindow == nil {
+            settingsWindow = TapSettingsWindow(settings: settings) { [weak self] value in
+                self?.applySettings(value)
+            }
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.showWindow(nil)
+        settingsWindow?.window?.makeKeyAndOrderFront(nil)
+    }
+    func applySettings(_ value: TapSettings) {
+        settings = value.sanitized
+        if let data = try? JSONEncoder().encode(settings) { UserDefaults.standard.set(data, forKey: "tapSettings") }
+        cancelGestures()
+        recognizers.removeAll()
+        updateInfo()
+    }
     func updateInfo() {
         info?.string = """
-        MagicTap 0.1.1 — экспериментальная сборка для Apple Silicon
+        MagicTap 0.1.2 — экспериментальная сборка для Apple Silicon
 
         Состояние: \(message)
         Получено кадров: \(frames). Отправлено кликов: \(clicks).
         Распознано tap: \(recognizedTaps). Пустых кадров: \(emptyFrames).
         Кадров с вмешательством: \(interferenceFrames). Невалидных/задержанных: \(invalidFrames).
         Состояния контактов (код: количество): \(stateCounts.keys.sorted().map { "\($0): \(stateCounts[$0]!)" }.joined(separator: ", "))
+        Отменено перед отправкой клика: \(cancelledClicks).
+        Причины отклонения: \(rejectionCounts.keys.sorted { $0.rawValue < $1.rawValue }.map { "\($0.rawValue): \(rejectionCounts[$0]!)" }.joined(separator: "; "))
+        Настройки: минимум \(Int((settings.minDuration * 1000).rounded())) мс, максимум \(Int((settings.maxDuration * 1000).rounded())) мс, движение пальца \(Int((settings.maxMovement * 100).rounded()))%, курсор \(Int(settings.cursorTolerance)) пт, задержка \(Int((settings.clickDelay * 1000).rounded())) мс.
         Счётчики обновляются при повторном открытии этого окна.
         Универсальный доступ: \(AXIsProcessTrusted() ? "да" : "нет")
         Мониторинг ввода: \(CGPreflightListenEventAccess() ? "да" : "нет")
@@ -226,7 +303,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         3. При необходимости перезапустите приложение, затем включите «Клик касанием».
         4. Уберите пальцы с поверхности и легко коснитесь одним пальцем.
 
-        Короткое касание 25–240 мс вызывает левый клик после отпускания. Движение, прокрутка, несколько пальцев и физические нажатия отменяют жест. Для двойного клика коснитесь дважды. Долгое касание не перетаскивает.
+        Длительность и чувствительность меняются через меню «Чувствительность…». Для быстрых лёгких касаний начните с режима «Быстрые касания» (минимум 8 мс). Небольшое дрожание мыши допускается в пределах настройки; прокрутка, несколько пальцев и физическое нажатие отменяют жест. Для двойного клика коснитесь дважды. Долгое касание не перетаскивает.
 
         Требуются касания без другого пальца, лежащего на мыши. Пороги консервативные и требуют проверки на вашей мыши. Выключение останавливает чтение касаний и мониторинг событий.
 

@@ -7,11 +7,11 @@ func expect(_ condition: Bool, _ name: String) {
 func touch(_ state: Int32 = 3, _ x: Double = 0.5, _ y: Double = 0.5, _ id: Int32 = 1) -> Touch {
     Touch(id:id,state:state,x:x,y:y)
 }
-func ready() -> TapRecognizer {
-    var r = TapRecognizer(); _ = r.frame([],time:0,interference:false); return r
+func ready(_ settings: TapSettings = .careful) -> TapRecognizer {
+    var r = TapRecognizer(settings: settings); _ = r.frame([],time:0,interference:false); return r
 }
-func run(_ frames: [([Touch],Double,Bool)]) -> Int {
-    var r = ready(); return frames.reduce(0) { n,f in n + (r.frame(f.0,time:f.1,interference:f.2) ? 1 : 0) }
+func run(_ frames: [([Touch],Double,Bool)], settings: TapSettings = .careful) -> Int {
+    var r = ready(settings); return frames.reduce(0) { n,f in n + (r.frame(f.0,time:f.1,interference:f.2) ? 1 : 0) }
 }
 expect(run([([touch()],0.1,false),([],0.2,false)]) == 1,"single tap")
 expect(run([([touch()],0.1,false),([touch(4)],0.15,false),([touch(5)],0.2,false),([],0.21,false)]) == 1,"release emitted once")
@@ -48,10 +48,65 @@ resetWhileIdle.cancel()
 _ = resetWhileIdle.frame([touch()],time:2,interference:false)
 expect(!resetWhileIdle.frame([],time:2.1,interference:false),"explicit reset still requires clean baseline")
 expect(run([([touch()],0.1,true),([touch(4)],0.3,false),([],0.35,false)]) == 0,"interference on initial down remains blocked")
-var firstContact = TapRecognizer()
+var firstContact = TapRecognizer(settings: .careful)
 _ = firstContact.frame([touch()],time:100,interference:false)
 expect(!firstContact.frame([],time:100.1,interference:false),"startup with no baseline ignores first gesture")
-var restingAtStartup = TapRecognizer()
+var restingAtStartup = TapRecognizer(settings: .careful)
 _ = restingAtStartup.frame([touch(4)],time:100,interference:false)
 expect(!restingAtStartup.frame([],time:100.1,interference:false),"resting state-4 contact at startup is ignored")
-print("PASS: \(checks) recognizer checks")
+// Fast taps are a deliberate setting; the legacy profile retains its old protection.
+for duration in [0.008, 0.012, 0.016, 0.024] {
+    expect(run([([touch()],0,false),([],duration,false)],settings:.fast) == 1,"fast profile accepts \(duration)s tap")
+    expect(run([([touch()],0,false),([],duration,false)],settings:.careful) == 0,"careful profile rejects \(duration)s tap")
+}
+expect(run([([touch()],0,false),([],0.004,false)],settings:.fast) == 0,"fast profile still rejects subminimum contact")
+expect(run([([touch()],0.1,false),([touch(4,0.555)],0.12,false),([],0.13,false)],settings:.fast) == 1,"fast profile tolerates modest finger movement")
+expect(run([([touch()],0.1,false),([touch(4,0.555)],0.12,false),([],0.13,false)],settings:.careful) == 0,"careful movement limit unchanged")
+expect(run([([touch()],0.1,false),([touch(4,0.7)],0.12,false),([],0.13,false)],settings:.fast) == 0,"fast profile still rejects swipe")
+expect(run([([touch()],0.1,false),([],0.4,false)],settings:.fast) == 1,"fast duration limit accepts ordinary longer tap")
+expect(run([([touch()],0.1,false),([],0.55,false)],settings:.fast) == 0,"fast profile does not accept long rest")
+expect(run([([touch()],0.1,false),([],0.65,false)],settings:TapSettings(maxDuration:0.6)) == 1,"custom maximum duration is not capped by stale-frame cutoff")
+expect(run([([touch()],0.1,false),([],0.112,false),([touch()],0.2,false),([],0.212,false)],settings:.fast) == 2,"quick double tap accepted")
+expect(run([([touch(3,0.025)],0.1,false),([],0.12,false)],settings:.fast) == 1,"fast edge setting expands usable surface")
+expect(run([([touch(3,0.005)],0.1,false),([],0.12,false)],settings:.fast) == 0,"fast profile keeps configured edge rejection")
+expect(run([([touch(3,0.005)],0.1,false),([],0.12,false)],settings:TapSettings(edgeMargin:0)) == 1,"edge margin is adjustable")
+var defaultRecognizer = TapRecognizer()
+_ = defaultRecognizer.frame([],time:0,interference:false)
+_ = defaultRecognizer.frame([touch()],time:0.1,interference:false)
+expect(defaultRecognizer.frame([],time:0.112,interference:false),"new recognizer defaults to fast profile")
+var fastFirstContact = TapRecognizer(settings:.fast)
+_ = fastFirstContact.frame([touch()],time:2,interference:false)
+expect(!fastFirstContact.frame([],time:2.012,interference:false),"fast profile preserves startup baseline protection")
+expect(run([([touch(),touch(3,0.7,0.5,2)],0.1,false),([],0.112,false)],settings:.fast) == 0,"fast profile rejects multiple fingers")
+expect(run([([touch()],0.1,false),([touch(4)],0.11,true),([],0.12,false)],settings:.fast) == 0,"fast profile rejects physical interference")
+var reasonCheck = ready(.fast)
+_ = reasonCheck.frame([touch()],time:0.1,interference:false)
+expect(reasonCheck.isActive,"active-contact state exposed")
+_ = reasonCheck.frame([],time:0.104,interference:false)
+expect(reasonCheck.lastRejection == .tooShort,"short-contact rejection reason")
+_ = reasonCheck.frame([],time:0.12,interference:false)
+expect(reasonCheck.lastRejection == nil,"rejection reason clears on next frame")
+_ = reasonCheck.frame([touch()],time:0.2,interference:false)
+reasonCheck.cancelIfActive(reason:.pointerMovement)
+expect(reasonCheck.lastRejection == .pointerMovement && !reasonCheck.isActive,"cursor cancellation reports reason")
+_ = reasonCheck.frame([touch(4)],time:0.21,interference:false)
+expect(reasonCheck.lastRejection == nil,"blocked frames do not repeat cancellation reason")
+_ = reasonCheck.frame([],time:0.22,interference:false)
+_ = reasonCheck.frame([touch()],time:0.3,interference:false)
+_ = reasonCheck.frame([touch(5,0.8)],time:0.32,interference:false)
+expect(reasonCheck.lastRejection == .releaseMovement,"release-coordinate movement has distinct reason")
+var multiReasons = ready(.fast)
+_ = multiReasons.frame([touch(),touch(3,0.7,0.5,2)],time:0.1,interference:false)
+expect(multiReasons.lastRejection == .multipleFingers,"multiple-contact reason reported")
+_ = multiReasons.frame([touch(),touch(3,0.7,0.5,2)],time:0.11,interference:false)
+expect(multiReasons.lastRejection == nil,"rejected contact is counted once while blocked")
+let nonfinite = TapSettings(minDuration:.nan,maxDuration:.infinity,maxMovement:-.infinity,edgeMargin:.nan,cursorTolerance:.infinity,clickDelay:.nan).sanitized
+expect(nonfinite == .fast,"nonfinite settings safely use default values")
+let extreme = TapSettings(minDuration:-100,maxDuration:100,maxMovement:0,edgeMargin:1,cursorTolerance:100,clickDelay:-1).sanitized
+expect(extreme == TapSettings(minDuration:0,maxDuration:0.6,maxMovement:0.01,edgeMargin:0.08,cursorTolerance:20,clickDelay:0),"all settings are clamped to UI bounds")
+let encoded = try! JSONEncoder().encode(TapSettings.balanced)
+let decoded = try! JSONDecoder().decode(TapSettings.self,from:encoded)
+expect(decoded == .balanced,"settings JSON persistence roundtrip")
+expect(TapSettings.balanced.sanitized == .balanced && TapSettings.careful.sanitized == .careful,"presets survive sanitization")
+expect(nonfinite.sanitized == nonfinite && extreme.sanitized == extreme,"sanitization is stable")
+print("PASS: \(checks) recognizer/settings checks")
