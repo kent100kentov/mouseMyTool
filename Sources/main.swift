@@ -60,6 +60,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if values.isEmpty { self.emptyFrames += 1 }
             for contact in values { self.stateCounts[contact.state, default: 0] += 1 }
+            // Read position only while a tap or delayed click needs a movement guard.
+            // No global movement events are subscribed to or forwarded through the app.
+            var sampledPoint: CGPoint?
+            if self.cursorGuard.hasActiveContacts || !self.pendingPoints.isEmpty {
+                guard let point = CGEvent(source: nil)?.location else {
+                    self.invalidFrames += 1; self.cancelGestures(reason: .invalidFrame); return
+                }
+                sampledPoint = point
+                self.cursorMoved(to: point)
+            }
             var recognizer = self.recognizers[device] ?? TapRecognizer(settings: self.settings)
             let wasActive = recognizer.isActive
             let interfered = ProcessInfo.processInfo.systemUptime - self.lastInterference < 0.15 || self.anyButtonDown()
@@ -67,7 +77,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let tap = recognizer.frame(values, time: time, interference: interfered)
             self.recordRejection(recognizer.lastRejection)
             if recognizer.isActive && !wasActive {
-                if let point = CGEvent(source: nil)?.location { self.cursorGuard.begin(device: device, at: point) }
+                if let point = sampledPoint ?? CGEvent(source: nil)?.location { self.cursorGuard.begin(device: device, at: point) }
                 else { recognizer.cancel(reason: .invalidFrame) }
             }
             if !recognizer.isActive { self.cursorGuard.end(device: device) }
@@ -141,21 +151,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         eventSource = nil; eventTap = nil; clickSequence.reset()
     }
     func startEventMonitor() -> Bool {
-        let types: [CGEventType] = [.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp,.scrollWheel,.mouseMoved,.leftMouseDragged,.rightMouseDragged,.otherMouseDragged]
-        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        // Physical buttons and scroll only. Native pointer movement bypasses this monitor.
+        let mask = InputEventPolicy.mask
         eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: mask, callback: { _, type, event, _ in
             guard let c = controller else { return Unmanaged.passUnretained(event) }
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                 c.cancelGestures()
                 if c.enabled, let tap = c.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             } else if event.getIntegerValueField(.eventSourceUserData) != eventTag {
-                if type == .mouseMoved {
-                    c.cursorMoved(to: event.location)
-                } else {
-                    c.lastInterference = ProcessInfo.processInfo.systemUptime
-                    c.clickSequence.reset()
-                    c.cancelGestures(preserveIdle: true, reason: .interference)
-                }
+                c.lastInterference = ProcessInfo.processInfo.systemUptime
+                c.clickSequence.reset()
+                c.cancelGestures(preserveIdle: true, reason: .interference)
             }
             return Unmanaged.passUnretained(event)
         }, userInfo: nil)
@@ -281,7 +287,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func updateInfo() {
         info?.string = """
-        MagicTap 0.1.3 — экспериментальная сборка для Apple Silicon
+        MagicTap 0.1.4 — экспериментальная сборка для Apple Silicon
 
         Состояние: \(message)
         Получено кадров: \(frames). Отправлено кликов: \(clicks).
@@ -293,6 +299,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Отменено перед отправкой клика: \(cancelledClicks).
         Причины отклонения: \(rejectionCounts.keys.sorted { $0.rawValue < $1.rawValue }.map { "\($0.rawValue): \(rejectionCounts[$0]!)" }.joined(separator: "; "))
         Настройки: минимум \(Int((settings.minDuration * 1000).rounded())) мс, максимум \(Int((settings.maxDuration * 1000).rounded())) мс, движение пальца \(Int((settings.maxMovement * 100).rounded()))%, курсор \(Int(settings.cursorTolerance)) пт, задержка \(Int((settings.clickDelay * 1000).rounded())) мс.
+        Движение указателя: без подписки на перемещения; проверка позиции только во время жеста/перед кликом.
+        Подавление физического ввода после tap-клика: выключено для источника MagicTap.
         Счётчики обновляются при повторном открытии этого окна.
         Универсальный доступ: \(AXIsProcessTrusted() ? "да" : "нет")
         Мониторинг ввода: \(CGPreflightListenEventAccess() ? "да" : "нет")

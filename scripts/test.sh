@@ -12,3 +12,10 @@ build/cursor-tests
 
 xcrun swiftc -swift-version 5 Sources/TapClick.swift Tests/TapClick/main.swift -o build/tap-click-tests
 build/tap-click-tests
+
+
+xcrun swiftc -swift-version 5 Sources/InputEventPolicy.swift Tests/InputEventPolicy/main.swift -framework CoreGraphics -o build/input-policy-tests
+build/input-policy-tests
+
+xcrun swiftc -swift-version 5 Sources/TapSettings.swift Sources/TapRecognizer.swift Sources/CursorGuard.swift Tests/CursorSampling/main.swift -o build/cursor-sampling-tests
+build/cursor-sampling-tests

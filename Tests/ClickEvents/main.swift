@@ -20,6 +20,15 @@ for button in [TapButton.left, .right] {
         expect(event.getIntegerValueField(.mouseEventClickState) == 2, "\(button) shared double-click count")
         expect(event.getIntegerValueField(.eventSourceUserData) == tag, "\(button) self-event tag")
         expect(event.flags == flags, "\(button) modifier flags")
+        let source = CGEventSource(event: event)
+        expect(source != nil, "\(button) event retains configured source")
+        guard let source else { fatalError("missing source") }
+        expect(source.localEventsSuppressionInterval == 0, "\(button) source has no hardware suppression interval")
+        let permitted: CGEventFilterMask = [.permitLocalMouseEvents, .permitLocalKeyboardEvents, .permitSystemDefinedEvents]
+        expect(source.getLocalEventsFilterDuringSuppressionState(.eventSuppressionStateSuppressionInterval) == permitted,
+               "\(button) suppression interval permits ordinary mouse, keyboard, and system events")
+        expect(source.getLocalEventsFilterDuringSuppressionState(.eventSuppressionStateRemoteMouseDrag) == permitted,
+               "\(button) synthetic drag state permits ordinary mouse, keyboard, and system events")
     }
 }
 expect(MouseClickEvents.make(button: .right, at: point, clickCount: 0, flags: [], tag: tag) == nil, "zero count rejected")

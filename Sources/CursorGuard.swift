@@ -4,6 +4,7 @@ import Foundation
 /// Small individual movements never shift the baseline, so a slow drag still cancels.
 struct CursorGuard {
     private var origins: [UInt64: CGPoint] = [:]
+    var hasActiveContacts: Bool { !origins.isEmpty }
 
     mutating func begin(device: UInt64, at point: CGPoint) {
         guard origins[device] == nil else { return }
