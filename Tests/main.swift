@@ -59,7 +59,7 @@ for duration in [0.008, 0.012, 0.016, 0.024] {
     expect(run([([touch()],0,false),([],duration,false)],settings:.fast) == 1,"fast profile accepts \(duration)s tap")
     expect(run([([touch()],0,false),([],duration,false)],settings:.careful) == 0,"careful profile rejects \(duration)s tap")
 }
-expect(run([([touch()],0,false),([],0.004,false)],settings:.fast) == 0,"fast profile still rejects subminimum contact")
+expect(run([([touch()],0,false),([],0.001,false)],settings:.fast) == 0,"fast profile still rejects subminimum contact")
 expect(run([([touch()],0.1,false),([touch(4,0.555)],0.12,false),([],0.13,false)],settings:.fast) == 1,"fast profile tolerates modest finger movement")
 expect(run([([touch()],0.1,false),([touch(4,0.555)],0.12,false),([],0.13,false)],settings:.careful) == 0,"careful movement limit unchanged")
 expect(run([([touch()],0.1,false),([touch(4,0.7)],0.12,false),([],0.13,false)],settings:.fast) == 0,"fast profile still rejects swipe")
@@ -82,7 +82,7 @@ expect(run([([touch()],0.1,false),([touch(4)],0.11,true),([],0.12,false)],settin
 var reasonCheck = ready(.fast)
 _ = reasonCheck.frame([touch()],time:0.1,interference:false)
 expect(reasonCheck.isActive,"active-contact state exposed")
-_ = reasonCheck.frame([],time:0.104,interference:false)
+_ = reasonCheck.frame([],time:0.101,interference:false)
 expect(reasonCheck.lastRejection == .tooShort,"short-contact rejection reason")
 _ = reasonCheck.frame([],time:0.12,interference:false)
 expect(reasonCheck.lastRejection == nil,"rejection reason clears on next frame")
@@ -109,4 +109,28 @@ let decoded = try! JSONDecoder().decode(TapSettings.self,from:encoded)
 expect(decoded == .balanced,"settings JSON persistence roundtrip")
 expect(TapSettings.balanced.sanitized == .balanced && TapSettings.careful.sanitized == .careful,"presets survive sanitization")
 expect(nonfinite.sanitized == nonfinite && extreme.sanitized == extreme,"sanitization is stable")
+// Screenshot defaults and legacy settings must apply equally to both sides.
+expect(TapSettings.fast.minDuration == 0.002 && TapSettings.fast.maxDuration == 0.35 && TapSettings.fast.maxMovement == 0.07 && TapSettings.fast.cursorTolerance == 8 && TapSettings.fast.clickDelay == 0.008 && TapSettings.fast.rightTapEnabled, "screenshot defaults and right tap enabled")
+let legacyJSON = "{\"minDuration\":0.011,\"maxDuration\":0.27,\"maxMovement\":0.04,\"edgeMargin\":0.03,\"cursorTolerance\":6,\"clickDelay\":0.043}".data(using: .utf8)!
+let legacySettings = try! JSONDecoder().decode(TapSettings.self, from: legacyJSON)
+expect(legacySettings == TapSettings(minDuration:0.011,maxDuration:0.27,maxMovement:0.04,edgeMargin:0.03,cursorTolerance:6,clickDelay:0.043,rightTapEnabled:true), "legacy settings retain all tuning and enable right tap")
+var disabledRight = TapSettings.fast
+disabledRight.rightTapEnabled = false
+let roundtripRight = try! JSONDecoder().decode(TapSettings.self, from: JSONEncoder().encode(disabledRight))
+expect(!roundtripRight.rightTapEnabled && !disabledRight.sanitized.rightTapEnabled, "right-tap opt-out survives save and sanitization")
+var tapOrigin = ready(.fast)
+_ = tapOrigin.frame([touch(3,0.49)],time:0.1,interference:false)
+expect(tapOrigin.frame([touch(5,0.51)],time:0.11,interference:false) && tapOrigin.lastTapX == 0.49, "tap side uses contact onset, not release drift")
+_ = tapOrigin.frame([],time:0.12,interference:false)
+expect(tapOrigin.lastTapX == nil, "tap origin is emitted once")
+_ = tapOrigin.frame([touch(3,0.8)],time:0.2,interference:false)
+tapOrigin.cancel()
+expect(!tapOrigin.frame([],time:0.21,interference:false) && tapOrigin.lastTapX == nil, "cancelled right-side gesture emits no origin")
+for x in [0.25, 0.75] {
+    var side = ready(.fast)
+    _ = side.frame([touch(3,x)],time:0,interference:false)
+    expect(side.frame([],time:0.002,interference:false) && side.lastTapX == x, "both sides use identical minimum timing")
+    _ = side.frame([touch(3,x)],time:1,interference:false)
+    expect(!side.frame([],time:1.001,interference:false), "both sides reject subminimum noise")
+}
 print("PASS: \(checks) recognizer/settings checks")

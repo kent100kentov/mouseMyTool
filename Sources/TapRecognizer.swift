@@ -27,6 +27,7 @@ enum TapRejection: String, CaseIterable {
 struct TapRecognizer {
     private(set) var settings: TapSettings
     private(set) var lastRejection: TapRejection?
+    private(set) var lastTapX: Double?
     private var armed = false
     private var blocked = true // Require an empty frame before accepting the first gesture.
     private var rejectionReported = false
@@ -50,6 +51,7 @@ struct TapRecognizer {
     }
 
     mutating func cancel(reason: TapRejection? = nil) {
+        lastTapX = nil
         if let reason, !rejectionReported { lastRejection = reason; rejectionReported = true }
         armed = false; blocked = true
     }
@@ -60,6 +62,7 @@ struct TapRecognizer {
 
     mutating func frame(_ touches: [Touch], time: Double, interference: Bool) -> Bool {
         lastRejection = nil
+        lastTapX = nil
         guard time.isFinite, time >= lastTime else { cancel(reason: .invalidTime); return false }
         // The framework may send no frames while the mouse surface is empty.
         // Only an interrupted active gesture is stale; an idle gap is normal.
@@ -79,6 +82,7 @@ struct TapRecognizer {
             if armed && !blocked && !accepted {
                 cancel(reason: duration < settings.minDuration ? .tooShort : .tooLong)
             }
+            if accepted { lastTapX = origin.x }
             armed = false; blocked = false; rejectionReported = false
             return accepted
         }

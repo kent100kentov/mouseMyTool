@@ -8,3 +8,7 @@ build/recognizer-tests
 
 xcrun swiftc -swift-version 5 Sources/CursorGuard.swift Tests/CursorGuard/main.swift -o build/cursor-tests
 build/cursor-tests
+
+
+xcrun swiftc -swift-version 5 Sources/TapClick.swift Tests/TapClick/main.swift -o build/tap-click-tests
+build/tap-click-tests

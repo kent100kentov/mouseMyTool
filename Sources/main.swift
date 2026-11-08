@@ -29,9 +29,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pendingGeneration: UInt64 = 0
     var reconnect: DispatchWorkItem?
     var sleeping = false
-    var lastClick = -Double.infinity
-    var lastPoint = CGPoint.zero
-    var clickCount: Int64 = 0
+    var clickSequence = ClickSequenceTracker()
+    var leftClicks = 0
+    var rightClicks = 0
     var frames = 0
     var clicks = 0
     var recognizedTaps = 0
@@ -72,7 +72,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if !recognizer.isActive { self.cursorGuard.end(device: device) }
             self.recognizers[device] = recognizer
-            if tap { self.recognizedTaps += 1; self.scheduleClick() }
+            if tap, let x = recognizer.lastTapX,
+               let button = TapButton.forTouch(x: x, rightTapEnabled: self.settings.rightTapEnabled) {
+                self.recognizedTaps += 1
+                self.scheduleClick(button: button)
+            }
         }
         MTWatchDevices { [weak self] in self?.scheduleReconnect() }
         let center = NSWorkspace.shared.notificationCenter
@@ -86,7 +90,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showSettings()
             // Smoke mode forces enabled=false: exercise pending-tap ordering without posting input.
             let before = cancelledClicks
-            scheduleClick(); scheduleClick()
+            scheduleClick(button: .left); scheduleClick(button: .right)
             precondition(pendingPoints.count == 2, "Rapid taps must remain separate")
             cancelPendingClick()
             precondition(pendingPoints.isEmpty && cancelledClicks == before + 2, "Cancel must clear all pending taps")
@@ -134,7 +138,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cancelGestures(); recognizers.removeAll(); bridge.stop()
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
         if let source = eventSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
-        eventSource = nil; eventTap = nil; lastClick = -.infinity; clickCount = 0
+        eventSource = nil; eventTap = nil; clickSequence.reset()
     }
     func startEventMonitor() -> Bool {
         let types: [CGEventType] = [.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp,.scrollWheel,.mouseMoved,.leftMouseDragged,.rightMouseDragged,.otherMouseDragged]
@@ -149,7 +153,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     c.cursorMoved(to: event.location)
                 } else {
                     c.lastInterference = ProcessInfo.processInfo.systemUptime
-                    c.lastClick = -.infinity
+                    c.clickSequence.reset()
                     c.cancelGestures(preserveIdle: true, reason: .interference)
                 }
             }
@@ -176,7 +180,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status?.button?.appearsDisabled = !enabled
         updateInfo()
     }
-    func scheduleClick() {
+    func scheduleClick(button: TapButton) {
         let token = pendingGeneration
         nextPendingID &+= 1
         let id = nextPendingID
@@ -193,25 +197,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   hypot(current.x-point.x,current.y-point.y) <= self.settings.cursorTolerance else {
                 self.cancelledClicks += 1; return
             }
-            self.postClick(at: current)
+            self.postClick(at: current, button: button)
         }
     }
-    func postClick(at point: CGPoint) {
-        let now = ProcessInfo.processInfo.systemUptime
-        if now-lastClick <= NSEvent.doubleClickInterval && hypot(point.x-lastPoint.x,point.y-lastPoint.y) < 4 {
-            clickCount += 1
-        } else { clickCount = 1 }
-        guard let source = CGEventSource(stateID: .hidSystemState),
-              let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-              let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else { return }
-        let flags = CGEventSource.flagsState(.combinedSessionState)
-        for event in [down,up] {
-            event.setIntegerValueField(.eventSourceUserData,value: eventTag)
-            event.setIntegerValueField(.mouseEventClickState,value: clickCount)
-            event.flags = flags
-        }
-        down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
-        lastClick = now; lastPoint = point; clicks += 1
+    func postClick(at point: CGPoint, button: TapButton) {
+        let count = clickSequence.next(button: button, at: point,
+                                       time: ProcessInfo.processInfo.systemUptime,
+                                       interval: NSEvent.doubleClickInterval)
+        guard let pair = MouseClickEvents.make(button: button, at: point, clickCount: count,
+                                               flags: CGEventSource.flagsState(.combinedSessionState),
+                                               tag: eventTag) else { clickSequence.reset(); return }
+        pair.down.post(tap: .cghidEventTap); pair.up.post(tap: .cghidEventTap)
+        clicks += 1
+        if button == .left { leftClicks += 1 } else { rightClicks += 1 }
         message = "Работает • кликов: \(clicks)"
     }
     func scheduleReconnect() {
@@ -283,10 +281,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func updateInfo() {
         info?.string = """
-        MagicTap 0.1.2 — экспериментальная сборка для Apple Silicon
+        MagicTap 0.1.3 — экспериментальная сборка для Apple Silicon
 
         Состояние: \(message)
         Получено кадров: \(frames). Отправлено кликов: \(clicks).
+        Левых: \(leftClicks). Правых: \(rightClicks).
+        Правый клик касанием правой половины: \(settings.rightTapEnabled ? "включён" : "выключен").
         Распознано tap: \(recognizedTaps). Пустых кадров: \(emptyFrames).
         Кадров с вмешательством: \(interferenceFrames). Невалидных/задержанных: \(invalidFrames).
         Состояния контактов (код: количество): \(stateCounts.keys.sorted().map { "\($0): \(stateCounts[$0]!)" }.joined(separator: ", "))
@@ -303,7 +303,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         3. При необходимости перезапустите приложение, затем включите «Клик касанием».
         4. Уберите пальцы с поверхности и легко коснитесь одним пальцем.
 
-        Длительность и чувствительность меняются через меню «Чувствительность…». Для быстрых лёгких касаний начните с режима «Быстрые касания» (минимум 8 мс). Небольшое дрожание мыши допускается в пределах настройки; прокрутка, несколько пальцев и физическое нажатие отменяют жест. Для двойного клика коснитесь дважды. Долгое касание не перетаскивает.
+        Длительность и чувствительность меняются через меню «Чувствительность…». Левая половина поверхности даёт левый клик, правая — правый, если включён флажок в настройках. Все ползунки общие для обеих сторон. Режим «Быстрые касания» по умолчанию: минимум 2 мс и задержка 8 мс. Небольшое дрожание мыши допускается в пределах настройки; прокрутка, несколько пальцев и физическое нажатие отменяют жест. Для двойного клика коснитесь дважды. Долгое касание не перетаскивает.
 
         Требуются касания без другого пальца, лежащего на мыши. Пороги консервативные и требуют проверки на вашей мыши. Выключение останавливает чтение касаний и мониторинг событий.
 

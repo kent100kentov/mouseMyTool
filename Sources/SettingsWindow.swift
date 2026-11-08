@@ -4,13 +4,14 @@ final class TapSettingsWindow: NSWindowController {
     private var settings: TapSettings
     private let onChange: (TapSettings) -> Void
     private let profiles = NSPopUpButton()
+    private let rightTap = NSButton(checkboxWithTitle: "Правый клик касанием правой половины", target: nil, action: nil)
     private var sliders: [NSSlider] = []
     private var values: [NSTextField] = []
 
     init(settings: TapSettings, onChange: @escaping (TapSettings) -> Void) {
         self.settings = settings.sanitized
         self.onChange = onChange
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 610),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 700),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "MagicTap — чувствительность"
         window.isReleasedWhenClosed = false
@@ -43,6 +44,12 @@ final class TapSettingsWindow: NSWindowController {
         profiles.addItems(withTitles: ["Быстрые касания", "Обычный", "Осторожный", "Свои настройки"])
         profiles.target = self; profiles.action = #selector(profileChanged)
         stack.addArrangedSubview(profiles)
+        rightTap.target = self; rightTap.action = #selector(rightTapChanged)
+        stack.addArrangedSubview(rightTap)
+        let sharedHelp = NSTextField(wrappingLabelWithString: "При включённом правом клике: слева — левый клик, справа — контекстное меню. Регулировки ниже общие для обеих сторон.")
+        sharedHelp.font = .systemFont(ofSize: 12); sharedHelp.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(sharedHelp)
+        sharedHelp.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         let rows: [(String, Double, Double, String)] = [
             ("Минимальная длительность касания", 0, 40, "Меньше → принимаются более быстрые касания"),
             ("Максимальная длительность касания", 100, 600, "Больше → принимаются более медленные касания"),
@@ -70,7 +77,7 @@ final class TapSettingsWindow: NSWindowController {
             slider.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
             sliders.append(slider); values.append(value)
         }
-        let footer = NSTextField(wrappingLabelWithString: "Начните с «Быстрые касания» (минимум 8 мс). Если появляются случайные клики — увеличьте минимум или выберите «Осторожный». После изменения уберите палец с мыши и попробуйте снова.")
+        let footer = NSTextField(wrappingLabelWithString: "Начните с «Быстрые касания» (минимум 2 мс). Если появляются случайные клики — увеличьте минимум или выберите «Осторожный». После изменения уберите палец с мыши и попробуйте снова.")
         footer.font = .systemFont(ofSize: 12)
         stack.addArrangedSubview(footer)
         footer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -80,7 +87,10 @@ final class TapSettingsWindow: NSWindowController {
                        settings.maxMovement * 100, settings.cursorTolerance, settings.clickDelay * 1000]
         for index in sliders.indices { sliders[index].doubleValue = numbers[index] }
         updateLabels()
-        let selected = settings == .fast ? 0 : settings == .balanced ? 1 : settings == .careful ? 2 : 3
+        rightTap.state = settings.rightTapEnabled ? .on : .off
+        var tuning = settings
+        tuning.rightTapEnabled = true
+        let selected = tuning == .fast ? 0 : tuning == .balanced ? 1 : tuning == .careful ? 2 : 3
         profiles.selectItem(at: selected)
     }
     private func updateLabels() {
@@ -89,13 +99,19 @@ final class TapSettingsWindow: NSWindowController {
             values[index].stringValue = String(format: "%.0f %@", sliders[index].doubleValue, units[index])
         }
     }
+    @objc private func rightTapChanged() {
+        settings.rightTapEnabled = rightTap.state == .on
+        onChange(settings)
+    }
     @objc private func profileChanged() {
+        let enabled = settings.rightTapEnabled
         switch profiles.indexOfSelectedItem {
         case 0: settings = .fast
         case 1: settings = .balanced
         case 2: settings = .careful
         default: return
         }
+        settings.rightTapEnabled = enabled
         reloadControls(); onChange(settings)
     }
     @objc private func sliderChanged(_ slider: NSSlider) {
