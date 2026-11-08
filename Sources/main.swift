@@ -23,12 +23,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var clickCount: Int64 = 0
     var frames = 0
     var clicks = 0
+    var recognizedTaps = 0
+    var invalidFrames = 0
+    var emptyFrames = 0
+    var stateCounts = [Int32: Int]()
+    var interferenceFrames = 0
     var window: NSWindow?
     var info: NSTextView?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Avoid two copies injecting duplicate clicks.
-        if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.MagicTap").count > 1 {
+        if !CommandLine.arguments.contains("--smoke-test"), NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.MagicTap").count > 1 {
             NSApp.terminate(nil); return
         }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -36,17 +41,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status.menu = menu; menu.delegate = self
         bridge.handler = { [weak self] device, contacts, count, time in
             guard let self, self.enabled, !self.sleeping else { return }
-            if count < 0 { self.cancelGestures(); return }
+            if count < 0 { self.invalidFrames += 1; self.cancelGestures(); return }
             self.frames += 1
             let values = (0..<Int(count)).map { index -> Touch in
                 let c = contacts![index]
                 return Touch(id: c.identity, state: c.state, x: Double(c.x), y: Double(c.y))
             }
+            if values.isEmpty { self.emptyFrames += 1 }
+            for contact in values { self.stateCounts[contact.state, default: 0] += 1 }
             var recognizer = self.recognizers[device] ?? TapRecognizer()
             let interfered = ProcessInfo.processInfo.systemUptime - self.lastInterference < 0.15 || self.anyButtonDown()
+            if interfered { self.interferenceFrames += 1 }
             let tap = recognizer.frame(values, time: time, interference: interfered)
             self.recognizers[device] = recognizer
-            if tap { self.scheduleClick() }
+            if tap { self.recognizedTaps += 1; self.scheduleClick() }
         }
         MTWatchDevices { [weak self] in self?.scheduleReconnect() }
         let center = NSWorkspace.shared.notificationCenter
@@ -67,9 +75,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func anyButtonDown() -> Bool {
         (0..<5).contains { CGEventSource.buttonState(.combinedSessionState, button: CGMouseButton(rawValue: UInt32($0))!) }
     }
-    func cancelGestures() {
+    func cancelGestures(preserveIdle: Bool = false) {
         pendingGeneration &+= 1
-        for key in Array(recognizers.keys) { recognizers[key]?.cancel() }
+        for key in Array(recognizers.keys) {
+            if preserveIdle { recognizers[key]?.cancelIfActive() }
+            else { recognizers[key]?.cancel() }
+        }
     }
     func stop() {
         cancelGestures(); recognizers.removeAll(); bridge.stop()
@@ -86,9 +97,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 c.cancelGestures()
                 if c.enabled, let tap = c.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             } else if event.getIntegerValueField(.eventSourceUserData) != eventTag {
-                c.lastInterference = ProcessInfo.processInfo.systemUptime
+                // Idle cursor movement must not suppress the next deliberate tap.
+                // It still cancels any active touch or already scheduled click.
+                if type != .mouseMoved { c.lastInterference = ProcessInfo.processInfo.systemUptime }
                 c.lastClick = -.infinity
-                c.cancelGestures()
+                c.cancelGestures(preserveIdle: true)
             }
             return Unmanaged.passUnretained(event)
         }, userInfo: nil)
@@ -196,10 +209,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func updateInfo() {
         info?.string = """
-        MagicTap 0.1 — экспериментальная сборка для Apple Silicon
+        MagicTap 0.1.1 — экспериментальная сборка для Apple Silicon
 
         Состояние: \(message)
         Получено кадров: \(frames). Отправлено кликов: \(clicks).
+        Распознано tap: \(recognizedTaps). Пустых кадров: \(emptyFrames).
+        Кадров с вмешательством: \(interferenceFrames). Невалидных/задержанных: \(invalidFrames).
+        Состояния контактов (код: количество): \(stateCounts.keys.sorted().map { "\($0): \(stateCounts[$0]!)" }.joined(separator: ", "))
+        Счётчики обновляются при повторном открытии этого окна.
         Универсальный доступ: \(AXIsProcessTrusted() ? "да" : "нет")
         Мониторинг ввода: \(CGPreflightListenEventAccess() ? "да" : "нет")
 

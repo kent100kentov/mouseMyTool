@@ -20,9 +20,15 @@ struct TapRecognizer {
 
     mutating func cancel() { armed = false; blocked = true }
 
+    /// Pointer events between gestures must not discard a previously clean baseline.
+    /// While a touch is in progress, interference still blocks it until lift.
+    mutating func cancelIfActive() { if armed { cancel() } }
+
     mutating func frame(_ touches: [Touch], time: Double, interference: Bool) -> Bool {
         guard time.isFinite, time >= lastTime else { cancel(); return false }
-        if time - lastTime > 0.5 { cancel() }
+        // The framework may send no frames while the mouse surface is empty.
+        // Only an interrupted active gesture is stale; an idle gap is normal.
+        if armed && time - lastTime > 0.5 { cancel() }
         lastTime = time
         guard !interference else { cancel(); return false }
         // Hover / lingering contacts do not count; break-touch is a release frame.
@@ -43,8 +49,9 @@ struct TapRecognizer {
         }
         guard !blocked else { return false }
         if !armed {
-            // Do not accept a contact that was already down when listening started.
-            guard t.state == 3 else { cancel(); return false }
+            // A confirmed empty baseline proves this is a new contact even if
+            // the device omits the transient make-touch (3) frame. Startup is
+            // still blocked until a release/empty frame is observed.
             armed = true; identity = t.id; start = time; origin = (t.x,t.y)
         } else if t.id != identity || time - start > maxDuration || hypot(t.x-origin.x,t.y-origin.y) > maxMovement {
             cancel()
